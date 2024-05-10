@@ -16,7 +16,7 @@ class cDtKM27(object):
                  , S                    = None
                  , K                    = None
                  , lag                  = 14
-                 .R                     = None):
+                 , R                    = None):
         
         #--THESE PARAMETERS ARE ALLOWED TO CHANGE---------------------
         # from_param_name_2_value = {}
@@ -33,14 +33,11 @@ class cDtKM27(object):
         self.T   = T
         self.N   = N
 
-        if R is not None:
-            R,K = self.build_strat_matrix(R)
-        
-        self.K   = K
+        self.R = R     
+        self.K = K
+
         self.S   = S
         self.LAG = lag
-
-
 
     def extract_from_long_format_data(self,d
                                       , week_col        = "MMWRWK"
@@ -48,6 +45,7 @@ class cDtKM27(object):
                                       , flucount_column = "ttl_flu"
                                       , strata_column   = "strat"):
         import pandas as pd
+        import numpy as np
         from patsy import dmatrix
 
         #--PIVOT TO ONE SEASON PER COLUMN------------------------------------------------------------------------------------
@@ -59,16 +57,18 @@ class cDtKM27(object):
         cases_per_season.columns = [y for (x,y) in cases_per_season.columns]
         cases_per_season = order.merge(cases_per_season, left_on = ["MMWRWK"], right_index=True)
 
-        self.Y = cases_per_season.to_numpy()[1:,:]
+        self.Y = cases_per_season.to_numpy()[:,1:]
 
         #--EXTRACT SEASON STRATIFICATION-------------------------------------------------------------------------------------
         season2_strat = d[ [season_col,strata_column] ].drop_duplicates()
 
         R = dmatrix("C({:s})-1".format(strata_column),data=season2_strat)
         self.R = R
-        self.K = R.shape[-1]
+
+        K = R.shape[-1]
+        self.K = K
+
         return R,K
-        
         
     #--estimate serial interval based on Cowling here = https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3057478/ 
     def serial_interval_compute(self,m,v):
@@ -84,19 +84,24 @@ class cDtKM27(object):
     def generate_trajectory(self,from_param_name_2_value):
         import jax
         import jax.numpy as jnp
-
+        from jax.scipy.special import expit
+        from jax.scipy.special import logit
+        
         #--LOAD PARAMETER VALUES TO PRODUCE K KM27 TRAJECTORIES
-        r           = jnp.array(from_param_name_2_value["r"])            #--this is a tuple of length K
+        r           = expit( jnp.array(from_param_name_2_value["r"]) )            #--this is a tuple of length K
         R0          = jnp.array(from_param_name_2_value["R0"])          #--this is a tuple of length K
 
-        phi         = jnp.array(from_param_name_2_value["phi"])
+        phi         = expit( jnp.array(from_param_name_2_value["phi"]) )
         sigma       = jnp.array(from_param_name_2_value["sigma"])
 
         m           = jnp.array(from_param_name_2_value["serial_interval_m"] )  #--this is a tuple of length K
         v           = jnp.array(from_param_name_2_value["serial_interval_v"] )  #--this is a tuple of length K
 
-        vacc        = jnp.array(from_param_name_2_value["vacc"])             #--This is a tuple of length K
-        init_vacc   = jnp.array(from_param_name_2_value["init_vacc"])        #--This is a tuple of length K
+        vacc        = expit( jnp.array(from_param_name_2_value["vacc"])      )       #--This is a tuple of length K
+        init_vacc   = expit( jnp.array(from_param_name_2_value["init_vacc"]) )        #--This is a tuple of length K
+
+        tref        = jnp.array(from_param_name_2_value["tref"])
+        b           = jnp.array(from_param_name_2_value["b"])
     
         #--NUMBER OF WEEKS (T), NUMBER OF (S)EASONS AND NUMBER OF CLUSTERS (K)
         T   = self.T
@@ -109,12 +114,18 @@ class cDtKM27(object):
         serial_interval_compute = self.serial_interval_compute
         serial_interval         = jax.vmap( lambda m,v: serial_interval_compute(m,v) )(m,v) #--K X Lag #(INPUT IMPLICIT IS LAG)
 
-        #--DISCRETE KM27 BY DIEKMANN HTTPS://WWW.PNAS.ORG/DOI/10.1073/PNAS.2106332118#SEC-6---------
-        def one_step(past_si, array, R0, serial_interval,N,vacc):
-            past_s,past_i = past_si
 
-            change = jnp.exp( -jnp.sum(R0*serial_interval[::-1]*past_i/N ) )*(1-vacc)
-            
+        #--add in a term that allows the case count to be dormant awhile
+        cos_value = jnp.cos( 2*jnp.pi*(( jnp.arange(T*7).reshape(-1,1)-tref)/(T*7)))
+        betas     = R0*( 1 + (b*0.5)*cos_value ) 
+        
+        #--DISCRETE KM27 BY DIEKMANN HTTPS://WWW.PNAS.ORG/DOI/10.1073/PNAS.2106332118#SEC-6---------
+        def one_step(past_si, array, serial_interval,N,vacc):
+            past_s,past_i = past_si
+            t,beta        = array
+
+            change = jnp.exp( -jnp.sum(beta*serial_interval[::-1]*past_i/N ) )*(1-vacc)
+
             s_vacc = past_s[-1]
             s = past_s[-1]*change
             i = past_s[-1]*(1-change)
@@ -130,9 +141,9 @@ class cDtKM27(object):
         Yhat          = jnp.dstack([initial_s, initial_incs]) #--K X lag X states 
 
         #--EVOLVE TRAJECTORIES OVER TIME-----------------------------------------------------
-        _,states =  jax.vmap( lambda Yhat,serial_interval,R0: jax.lax.scan( lambda x,y,: one_step(x,y,R0,serial_interval,N,vacc)
-                                                                            , init = Yhat.T, xs = jnp.arange(T*7) )
-                          , in_axes = (0,0,0)  ) (Yhat, serial_interval, R0 )
+        _,states =  jax.vmap( lambda Yhat,serial_interval,beta: jax.lax.scan( lambda x,y,: one_step(x,y,serial_interval,N,vacc)
+                                                                            , init = Yhat.T, xs = (jnp.arange(T*7),beta) )
+                          , in_axes = (0,0,1)  ) (Yhat, serial_interval, betas )
 
         #--States is K X T X States
         s_days = states[...,0]
@@ -150,19 +161,38 @@ class cDtKM27(object):
     def from_vector_to_parameter_values(self,x):
         K = self.K
 
-        from_vector_to_parameter_values                      = {}
-        from_vector_to_parameter_values["r"]                 = x[0:K]
-        from_vector_to_parameter_values["R0"]                = x[K:2*K]
-        from_vector_to_parameter_values["serial_interval_m"] = x[2*K:3*K]
-        from_vector_to_parameter_values["serial_interval_v"] = x[3*K:4*K]
+        if self.R is None:
+            from_vector_to_parameter_values                      = {}
+            from_vector_to_parameter_values["r"]                 = x[0:K]
+            from_vector_to_parameter_values["R0"]                = x[K:2*K]
+            from_vector_to_parameter_values["serial_interval_m"] = x[2*K:3*K]
+            from_vector_to_parameter_values["serial_interval_v"] = x[3*K:4*K]
 
-        from_vector_to_parameter_values["theta"]             = x[4*K:5*K]           
+            from_vector_to_parameter_values["theta"]             = x[4*K:5*K]           
 
-        from_vector_to_parameter_values["vacc"]              = x[5*K]
-        from_vector_to_parameter_values["init_vacc"]         = x[5*K+1]
+            from_vector_to_parameter_values["tref"]              = x[5*K:6*K]
+            from_vector_to_parameter_values["b"]                 = x[6*K:7*K]
+ 
+            
+            from_vector_to_parameter_values["vacc"]              = x[7*K]
+            from_vector_to_parameter_values["init_vacc"]         = x[7*K+1]
 
-        from_vector_to_parameter_values["phi"]               = x[5*K+2]
-        from_vector_to_parameter_values["sigma"]             = x[5*K+3]
+            from_vector_to_parameter_values["phi"]               = x[7*K+2]
+            from_vector_to_parameter_values["sigma"]             = x[7*K+3]
+
+           
+        else:
+            from_vector_to_parameter_values                      = {}
+            from_vector_to_parameter_values["r"]                 = x[0:K]
+            from_vector_to_parameter_values["R0"]                = x[K:2*K]
+            from_vector_to_parameter_values["serial_interval_m"] = x[2*K:3*K]
+            from_vector_to_parameter_values["serial_interval_v"] = x[3*K:4*K]
+
+            from_vector_to_parameter_values["vacc"]              = x[4*K]
+            from_vector_to_parameter_values["init_vacc"]         = x[4*K+1]
+
+            from_vector_to_parameter_values["phi"]               = x[4*K+2]
+            from_vector_to_parameter_values["sigma"]             = x[4*K+3]
 
         self.from_param_name_2_value = from_vector_to_parameter_values
         return from_vector_to_parameter_values
@@ -174,6 +204,7 @@ class cDtKM27(object):
         import jax.numpy as jnp
         from jax.random import PRNGKey
         from jax.scipy.special import logsumexp
+        from jax.scipy.special import expit
 
         import numpyro
         import numpyro.distributions as dist
@@ -185,11 +216,13 @@ class cDtKM27(object):
         
         #--Add weights Season X K
         sigma   = from_param_name_2_value["sigma"] 
-        theta   = from_param_name_2_value["theta"]
-        weights = dist.Dirichlet(jnp.repeat(jnp.array(theta).reshape(1,-1),S,axis=0) ).sample(PRNGKey(np.random.randint(10**5) ))
+        theta   = expit(from_param_name_2_value["theta"])
+        weights = dist.Dirichlet(jnp.repeat(jnp.array(theta).reshape(1,-1),S,axis=0) ).mean#sample(PRNGKey(np.random.randint(10**5) ))
 
         try:
-            L   = jax.vmap( lambda O: dist.NegativeBinomial2(incident_curves+10**-10,sigma).mask( (~jnp.isnan(O)).reshape(-1,1) ).log_prob(O.reshape(-1,1)).sum(0))(Y.T)
+            #L   = jax.vmap( lambda O: dist.NegativeBinomial2(incident_curves+10**-10,sigma).mask( (~jnp.isnan(O)).reshape(-1,1) ).log_prob(O.reshape(-1,1)).sum(0))(Y.T)
+            L   = jax.vmap( lambda O: dist.Poisson(incident_curves+10**-10).mask( (~jnp.isnan(O)).reshape(-1,1) ).log_prob(O.reshape(-1,1)).sum(0))(Y.T)
+            
             W   = jnp.log(weights)
             sol = float(sum(logsumexp( (W+L), axis=1)))
             self.loglik = sol
@@ -204,7 +237,7 @@ class cDtKM27(object):
             self.loglik = sol
         return -1*self.loglik
 
-    def evaluate_nloglik_fixed(self,parameter_vector,Y,R):
+    def evaluate_nloglik_fixed(self,parameter_vector,Y):
         import numpy as np
         
         import jax
@@ -216,37 +249,29 @@ class cDtKM27(object):
         import numpyro.distributions as dist
 
         S = self.S
+        R = self.R
         
         from_param_name_2_value = self.from_vector_to_parameter_values(parameter_vector)
         incident_curves         = self.generate_trajectory( from_param_name_2_value  )
+
+        incident_curves_across_strata = jnp.matmul(incident_curves, R.T)
         
         #--Add weights Season X K
         sigma   = from_param_name_2_value["sigma"] 
-        theta   = from_param_name_2_value["theta"]
-        weights = dist.Dirichlet(jnp.repeat(jnp.array(theta).reshape(1,-1),S,axis=0) ).sample(PRNGKey(np.random.randint(10**5) ))
-
         try:
-            L   = jax.vmap( lambda O: dist.NegativeBinomial2(incident_curves+10**-10,sigma).mask( (~jnp.isnan(O)).reshape(-1,1) ).log_prob(O.reshape(-1,1)).sum(0))(Y.T)
-            W   = jnp.log(weights)
-            sol = float(sum(logsumexp( (W+L), axis=1)))
+            sol   = dist.NegativeBinomial2(incident_curves_across_strata+10**-10,sigma).mask( (~jnp.isnan(Y)) ).log_prob(Y).sum()
             self.loglik = sol
-
         except RuntimeWarning:
             self.loglik = np.inf
             return np.inf
-        
         if np.isnan(sol):
+            
             self.loglik = np.inf
         else:
             self.loglik = sol
         return -1*self.loglik
 
-       
-        
-
-    
-
-    def fit(self, Y,  method="GA", polish=True):
+    def fit(self, Y,  method="GA", polish=False):
         from pymoo.core.problem           import ElementwiseProblem
         from pymoo.operators.sampling.lhs import LHS
         from pymoo.optimize               import minimize
@@ -258,33 +283,58 @@ class cDtKM27(object):
 
         import numpy as np
 
-        #--DEFINE OPTIMIZATION PROBLEM------------------------------------
-        class MyProblem(ElementwiseProblem):
-            def __init__(self,K,eval_func,**kwargs):
-                import numpy as np
-                self.K         = K
-                self.evaluator = eval_func
-
-                lower_bound = np.array( [0]*K + [0.5]*K + [3.55]*K   + [2.85]*K + [0]*K + [0] + [0.9999] + [0] + [0.5])
-                upper_bound = np.array( [1]*K +   [3]*K + [3.65]*K   + [2.95]*K + [1]*K + [1] + [1] + [1] +   [2])
-                
-                super().__init__(n_var        = 5*K+4,
-                                 n_obj        = 1,
-                                 n_eq_constr  = 0,
-                                 n_ieq_constr = 0,
-                                 xl           = lower_bound,
-                                 xu           = upper_bound)
-
-            def _evaluate(self, x, out, *args, **kwargs):
-                out["F"] = [self.evaluator(x)]
-
-        n_threads = 8
+        n_threads = 1
         pool      = ThreadPool(n_threads)
         runner    = StarmapParallelization(pool.starmap)
 
-        # define the problem by passing the starmap interface of the thread pool
-        problem = MyProblem(elementwise_runner=runner,K=self.K, eval_func = lambda x: self.evaluate_nloglik(x,Y=Y))
-                
+        R = self.R
+        
+        #--DEFINE OPTIMIZATION PROBLEM------------------------------------
+        if R is None:
+            class MyProblem(ElementwiseProblem):
+                def __init__(self,K,eval_func,**kwargs):
+                    import numpy as np
+                    self.K         = K
+                    self.evaluator = eval_func
+
+                    lower_bound = np.array( [-2]*K + [0.5]*K + [3.55]*K    + [2.85]*K  + [-10]*K  + [0]*K    + [0]*K    + [-10] + [-10] + [-10] +  [1.])
+                    upper_bound = np.array( [ 2]*K +   [3]*K  + [3.65]*K   + [2.95]*K  +  [10]*K  + [33*7]*K + [1]*K    + [10]  + [10]  + [10]  +   [5])
+
+                    super().__init__(n_var        = 7*K+4,
+                                     n_obj        = 1,
+                                     n_eq_constr  = 0,
+                                     n_ieq_constr = 0,
+                                     xl           = lower_bound,
+                                     xu           = upper_bound)
+
+                def _evaluate(self, x, out, *args, **kwargs):
+                    out["F"] = [self.evaluator(x)]
+
+            # define the problem by passing the starmap interface of the thread pool
+            problem = MyProblem(elementwise_runner=runner,K=self.K, eval_func = lambda x: self.evaluate_nloglik(x,Y=Y))
+        else: #--NO THETA
+            class MyProblem(ElementwiseProblem):
+                def __init__(self,K,eval_func,**kwargs):
+                    import numpy as np
+                    self.K         = K
+                    self.evaluator = eval_func
+
+                    lower_bound = np.array( [-10]*K + [0.5]*K + [3.55]*K   + [2.85]*K  + [-10]  + [-10]  + [-10]  + [1.])
+                    upper_bound = np.array( [10]*K  +   [3]*K + [3.65]*K   + [2.95]*K  + [ 10]  + [ 10]  + [ 10]  +  [5])
+
+                    super().__init__(n_var        = 4*K+4,
+                                     n_obj        = 1,
+                                     n_eq_constr  = 0,
+                                     n_ieq_constr = 0,
+                                     xl           = lower_bound,
+                                     xu           = upper_bound)
+
+                def _evaluate(self, x, out, *args, **kwargs):
+                    out["F"] = [self.evaluator(x)]
+
+            # define the problem by passing the starmap interface of the thread pool
+            problem = MyProblem(elementwise_runner=runner,K=self.K, eval_func = lambda x: self.evaluate_nloglik_fixed(x,Y=Y))
+            
         #--ALGORITHMS TO SOLVE PROBLEM----------------------------------------------------
         if method=="GA":
             from pymoo.algorithms.soo.nonconvex.ga import GA
@@ -337,21 +387,9 @@ class cDtKM27(object):
     def best_fit_centers(self):
         return self.generate_trajectory(self.from_param_name_2_value)
                 
-
-
-
-            
+           
         
     #     L   = jax.vmap( lambda O: dist.NegativeBinomial2(i_hat+10**-10,sigma).mask( (~jnp.isnan(O)).reshape(-1,1) ).log_prob(O.reshape(-1,1)).sum(0))(obs.T)
     #     responsabilities = jnp.exp(L - logsumexp(L,axis=1).reshape(-1,1)) #--exp( log(p1) - log(p1+p2)  )
     #     return i_hat, responsabilities, jnp.matmul(responsabilities, i_hat.T)
-
-
-
-
-    
-
-
-
-    
 
