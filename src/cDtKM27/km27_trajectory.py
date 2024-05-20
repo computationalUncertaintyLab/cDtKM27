@@ -81,7 +81,6 @@ class cDtKM27(object):
         R0          = jnp.array(from_param_name_2_value["R0"])          #--this is a tuple of length K
 
         phi         = expit( jnp.array(from_param_name_2_value["phi"]) )
-        sigma       = jnp.array(from_param_name_2_value["sigma"])
 
         m           = jnp.array(from_param_name_2_value["serial_interval_m"] )  #--this is a tuple of length K
         v           = jnp.array(from_param_name_2_value["serial_interval_v"] )  #--this is a tuple of length K
@@ -147,13 +146,14 @@ class cDtKM27(object):
         self.incident_curves = i_hat
         return i_hat
 
-    def from_vector_to_parameter_values(self,x):
+    def from_vector_to_parameter_values(self,x,sigma=False):
         import numpyro
         numpyro.enable_x64(True)
         
         K = self.K
 
         if self.R is None:
+            
             from_vector_to_parameter_values                      = {}
             from_vector_to_parameter_values["r"]                 = x[0:K]
             from_vector_to_parameter_values["R0"]                = x[K:2*K]
@@ -170,7 +170,9 @@ class cDtKM27(object):
             from_vector_to_parameter_values["init_vacc"]         = x[7*K+1]
 
             from_vector_to_parameter_values["phi"]               = x[7*K+2]
-            from_vector_to_parameter_values["sigma"]             = x[7*K+3]
+
+            if sigma:
+                from_vector_to_parameter_values["sigma"]             = x[(7*K+2)+1:(7*K+2)+(K+1)]
            
         else:
             from_vector_to_parameter_values                      = {}
@@ -187,7 +189,8 @@ class cDtKM27(object):
             from_vector_to_parameter_values["init_vacc"]         = x[6*K+1]
 
             from_vector_to_parameter_values["phi"]               = x[6*K+2]
-            from_vector_to_parameter_values["sigma"]             = x[6*K+3]
+            if sigma:
+                from_vector_to_parameter_values["sigma"]         = x[(6*K+2)+1:(6*K+2) + (K+1)]
 
         self.from_param_name_2_value = from_vector_to_parameter_values
         return from_vector_to_parameter_values
@@ -207,11 +210,10 @@ class cDtKM27(object):
         S = self.S
 
         if from_param_name_2_value is None:
-            from_param_name_2_value = self.from_vector_to_parameter_values(parameter_vector)
+            from_param_name_2_value = self.from_vector_to_parameter_values(parameter_vector,sigma=False)
         incident_curves         = self.generate_trajectory( from_param_name_2_value  )
         
         #--Add weights Season X K
-        sigma   = from_param_name_2_value["sigma"] 
         theta   = expit(from_param_name_2_value["theta"])
         weights = dist.Dirichlet(jnp.repeat(jnp.array(theta).reshape(1,-1),S,axis=0) ).mean
 
@@ -224,12 +226,50 @@ class cDtKM27(object):
         except RuntimeWarning:
             self.loglik = jnp.inf
             return jnp.inf
-        
-        #if jnp.isnan(sol):
-        #    self.loglik = np.inf
-        #else:
         self.loglik = sol
         return -1*self.loglik
+
+
+    def evaluate_nloglik_mcmc(self,parameter_vector=None,from_param_name_2_value=None,Y=None):
+        import numpy as np
+        
+        import jax
+        import jax.numpy as jnp
+        from jax.random import PRNGKey
+        from jax.scipy.special import logsumexp
+        from jax.scipy.special import expit
+
+        import numpyro
+        import numpyro.distributions as dist
+
+        S = self.S
+
+        if from_param_name_2_value is None:
+            from_param_name_2_value = self.from_vector_to_parameter_values(parameter_vector)
+        incident_curves             = self.generate_trajectory( from_param_name_2_value  ) + 10**-10
+        
+        #--Add weights Season X K
+        theta   = expit(from_param_name_2_value["theta"])
+        weights =  numpyro.sample( "weights", dist.Dirichlet(jnp.repeat(jnp.array(theta).reshape(1,-1),S,axis=0) ) )
+
+        sigma = from_param_name_2_value["sigma"]
+        try:
+            L   = jax.vmap( lambda O: dist.Poisson(incident_curves).mask( (~jnp.isnan(O)).reshape(-1,1) ).log_prob(O.reshape(-1,1)).sum(0))(Y.T+10**-10)
+            W   = jnp.log(weights)
+            
+            Q = (W+L)
+            sol = sum(logsumexp( Q, axis=1))
+
+            responsabilities = jnp.exp(Q - logsumexp(Q,axis=1).reshape(-1,1))
+            
+            self.loglik = sol
+
+        except:
+            self.loglik = jnp.inf
+            return jnp.inf
+        
+        self.loglik = sol
+        return -1*self.loglik, responsabilities
 
     def evaluate_nloglik_fixed(self,parameter_vector,Y):
         import numpy as np
@@ -245,13 +285,12 @@ class cDtKM27(object):
         S = self.S
         R = self.R
         
-        from_param_name_2_value = self.from_vector_to_parameter_values(parameter_vector)
+        from_param_name_2_value = self.from_vector_to_parameter_values(parameter_vector,sigma=False)
         incident_curves         = self.generate_trajectory( from_param_name_2_value  )
 
         incident_curves_across_strata = jnp.matmul(incident_curves, R.T)
         
         #--Add weights Season X K
-        sigma   = from_param_name_2_value["sigma"] 
         try:
             sol   = dist.Poisson(incident_curves_across_strata+10**-10).mask( (~jnp.isnan(Y)) ).log_prob(Y).sum()
             self.loglik = sol
@@ -291,10 +330,10 @@ class cDtKM27(object):
                     self.K         = K
                     self.evaluator = eval_func
 
-                    lower_bound = np.array( [-2]*K + [0.5]*K  + [3.55]*K   + [2.85]*K  + [-10]*K  + [0]*K        + [0]*K    + [-10] + [-10] + [-10] +  [1.])
-                    upper_bound = np.array( [ 2]*K +   [3]*K  + [3.65]*K   + [2.95]*K  +  [10]*K  + [T*7]*K + [1]*K    + [10]  + [10]  + [10]  +   [5])
+                    lower_bound = np.array( [-2]*K + [0.5]*K  + [3.55]*K   + [2.85]*K  + [-10]*K  +   [0]*K + [0]*K  + [-10] + [-10] + [-10] )
+                    upper_bound = np.array( [ 2]*K +   [3]*K  + [3.65]*K   + [2.95]*K  +  [10]*K  + [T*7]*K + [1]*K  + [10]  + [10]  + [10]  )
 
-                    super().__init__(n_var        = 7*K+4,
+                    super().__init__(n_var        = 7*K+3,
                                      n_obj        = 1,
                                      n_eq_constr  = 0,
                                      n_ieq_constr = 0,
@@ -313,10 +352,10 @@ class cDtKM27(object):
                     self.K         = K
                     self.evaluator = eval_func
 
-                    lower_bound = np.array( [-2]*K + [0.5]*K  + [3.55]*K   + [2.85]*K  + [0]*K        + [0]*K    + [-10] + [-10] + [-10] +  [1.])
-                    upper_bound = np.array( [ 2]*K +   [3]*K  + [3.65]*K   + [2.95]*K  + [T*7]*K + [1]*K    + [10]  + [10]  + [10]  +   [5])
+                    lower_bound = np.array( [-2]*K + [0.5]*K  + [3.55]*K   + [2.85]*K  + [0]*K        + [0]*K    + [-10] + [-10] + [-10])
+                    upper_bound = np.array( [ 2]*K +   [3]*K  + [3.65]*K   + [2.95]*K  + [T*7]*K      + [1]*K    + [10]  + [10]  + [10] )
 
-                    super().__init__(n_var        = 6*K+4,
+                    super().__init__(n_var        = 6*K+3,
                                      n_obj        = 1,
                                      n_eq_constr  = 0,
                                      n_ieq_constr = 0,
@@ -342,7 +381,7 @@ class cDtKM27(object):
                 cvtol     = 1e-6,
                 ftol      = 1e-6,
                 period    = 20,
-                n_max_gen = 150,
+                n_max_gen = 125,
             )
             res = minimize(problem,
                            algorithm,
@@ -388,59 +427,75 @@ class cDtKM27(object):
         from   numpyro.infer import MCMC, NUTS, init_to_value
         
         from jax.random import PRNGKey
+        import jax.numpy as jnp
 
         numpyro.enable_x64(True)
 
-        def mcmcmodel(params=None,Y=None,forecast=False):
+        def mcmcmodel(params=None,Y=None,forecast=False,fixed=False):
             if params is None:
-                r     = numpyro.sample("r"    , dist.Normal(0      ,1*jnp.ones(K)))
-                R0    = numpyro.sample("R0"   , dist.Uniform(1    ,10*jnp.ones(K)))
-                phi   = numpyro.sample("phi"  , dist.Beta(1       ,1 ))
-                sigma = numpyro.sample("sigma", dist.Gamma(1      ,1 ))
-                m     = numpyro.sample("m"    , dist.Gamma(1*jnp.ones(K),1 ))
-                v     = numpyro.sample("v"    , dist.Gamma(1*jnp.ones(K),1 ))
+                r                 = numpyro.sample("r"                 , dist.Normal(  0*jnp.ones(self.K), 10         ) )
+                R0                = numpyro.sample("R0"                , dist.Normal(  2*jnp.ones(self.K), 5          ) )
+                phi               = numpyro.sample("phi"               , dist.Normal(  0     , 10) )
+                
+                sigma             = numpyro.sample("sigma"             , dist.HalfCauchy(1*jnp.ones(self.K)      ) )
+                
+                serial_interval_m = numpyro.sample("serial_interval_m" , dist.Normal(   3.6*jnp.ones(self.K)      , 10 ) )
+                serial_interval_v = numpyro.sample("serial_interval_v" , dist.Normal(   2.9*jnp.ones(self.K)      , 10 ) )
 
-                theta = numpyro.sample("theta", dist.Gamma(jnp.ones(K),1.)   )  #--This is a tuple of length k
+                vacc              = numpyro.sample("vacc"              , dist.Normal( 0, 10                       ) )
+                init_vacc         = numpyro.sample("init_vacc"         , dist.Normal( 0, 10                       ) )
+
+                tref              = numpyro.sample("tref"              , dist.Uniform( 0, self.T*7*jnp.ones(K)    ) )
+                b                 = numpyro.sample("b"                 , dist.Uniform( 0, 2*jnp.ones(self.K)           ) )
+                
+                theta             = numpyro.sample("theta"             , dist.Dirichlet(jnp.ones(K))   )  #--This is a tuple of length k
             else:
                 r                 = numpyro.sample("r"                 , dist.Normal(  params["r"]       , 10) )
                 R0                = numpyro.sample("R0"                , dist.Normal(  params["R0"]      , 5)  )
                 phi               = numpyro.sample("phi"               , dist.Normal(  params["phi"]     , 10) )
+               
+                sigma             = numpyro.sample("sigma"             , dist.Gamma(100*jnp.ones(self.K),1.                  ) )
                 
-                sigma             = numpyro.sample("sigma"             , dist.Gamma(1,1)                        )
-                
-                serial_interval_m = numpyro.sample("serial_interval_m" , dist.Normal(   params["serial_interval_m"]      , 10 ) )
-                serial_interval_v = numpyro.sample("serial_interval_v" , dist.Normal(   params["serial_interval_v"]      , 10 ) )
-
+                serial_interval_m = numpyro.sample("serial_interval_m" , dist.Normal(   params["serial_interval_m"]      , 1 ) )
+                serial_interval_v = numpyro.sample("serial_interval_v" , dist.Normal(   params["serial_interval_v"]      , 1 ) )
+               
                 vacc              = numpyro.sample("vacc"              , dist.Normal( params["vacc"]     , 10) )
                 init_vacc         = numpyro.sample("init_vacc"         , dist.Normal( params["init_vacc"], 10) )
 
-                tref              = numpyro.sample("tref"              , dist.Uniform( 0, self.T*7           ) )
-                b                 = numpyro.sample("b"                 , dist.Uniform( 0, 2                  ) )
-                
-                theta             = numpyro.sample("theta"             , dist.Gamma( params["theta"]         ) )
+                tref              = numpyro.sample("tref"              , dist.Uniform( 0, self.T*7*jnp.ones(self.K) ) )
+                b                 = numpyro.sample("b"                 , dist.Uniform( 0, 2*jnp.ones(self.K)        ) )
 
+                if fixed == False:
+                    theta             = numpyro.sample("theta"             , dist.Gamma( params["theta"],1           ) )
+                else:
+                    theta             = numpyro.sample("theta"             , dist.Gamma(jnp.ones(K),1.)   )  #--This is a tuple of length k
+                    
             params       = {  "r"                :r
                             , "R0"               :R0
                             , "phi"              :phi
-                            , "sigma"            :sigma
                             , "theta"            :theta
                             , "serial_interval_m":serial_interval_m
                             , "serial_interval_v":serial_interval_v
                             , "vacc"             :vacc
                             , "init_vacc"        :init_vacc
                             , "tref"             :tref
-                            , "b"                :b}
+                            , "b"                :b
+                            , "sigma"            :sigma }
             trajectories = self.generate_trajectory(params)
 
             numpyro.deterministic("trajectories", trajectories)
             
             #--observational error and weights
-            ll = self.evaluate_nloglik( from_param_name_2_value = params, Y=Y)
+            ll,responsabilities = self.evaluate_nloglik_mcmc( from_param_name_2_value = params, Y=Y)
             numpyro.factor("ll", -1*ll)
 
+            numpyro.deterministic("responsabilities", responsabilities)
+            
             if forecast:
-                numpyro.sample("yhat_pred", dist.Poisson(trajectories) )
+                yhat_unrestricted = numpyro.sample("yhat_unrestricted",  dist.Laplace(trajectories,sigma) )
+                numpyro.deterministic("ypred", jnp.clip(yhat_unrestricted, 0, jnp.inf) )
 
+        self.from_param_name_2_value["sigma"] = 100*jnp.ones(self.K)
         init_values = self.from_param_name_2_value
            
         num_warmup  = 6*10**3
@@ -465,12 +520,9 @@ class cDtKM27(object):
         self.predictions = predictions
         
         return samples, predictions
-        #except:
-        #    print("Error running mcmc")
-
 
     
-           
+          
         
     #     L   = jax.vmap( lambda O: dist.NegativeBinomial2(i_hat+10**-10,sigma).mask( (~jnp.isnan(O)).reshape(-1,1) ).log_prob(O.reshape(-1,1)).sum(0))(obs.T)
     #     responsabilities = jnp.exp(L - logsumexp(L,axis=1).reshape(-1,1)) #--exp( log(p1) - log(p1+p2)  )
